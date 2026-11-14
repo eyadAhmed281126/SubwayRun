@@ -1,8 +1,10 @@
+
 import cv2
 
 from camera import Camera
 from pose_detector import PoseDetector
 from gesture_controller import GestureController
+from game_controller import GameController
 
 
 def main():
@@ -10,14 +12,16 @@ def main():
     camera = Camera()
     detector = PoseDetector()
     controller = GestureController()
+    game_controller = GameController()
 
     try:
         with camera as cam:
 
             calibration_message = "Press C to calibrate"
-            # c for calibration
-            # r for reset calibration
-            # q for close
+
+            # c = start calibration
+            # r = reset calibration
+            # q = close
 
             while True:
 
@@ -41,9 +45,12 @@ def main():
 
                 # Determine current action
                 if controller.is_calibrated and not controller.is_calibrating:
-                   action = controller.get_action(landmarks)
+                    action = controller.get_action(landmarks)
                 else:
                     action = "NONE"
+
+                # Send gesture action to Subway Surfers
+                game_controller.send_action(action)
 
                 # Get frame dimensions
                 height, width = annotated_frame.shape[:2]
@@ -58,7 +65,7 @@ def main():
                     2
                 )
 
-                # Display STATUS and current action at bottom-left
+                # Display STATUS
                 cv2.putText(
                     annotated_frame,
                     "STATUS",
@@ -68,7 +75,8 @@ def main():
                     (255, 255, 255),
                     2
                 )
-                # the action
+
+                # Display current action
                 cv2.putText(
                     annotated_frame,
                     action,
@@ -94,19 +102,29 @@ def main():
 
                 key = cv2.waitKey(1) & 0xFF
 
+                # Start calibration
                 if key == ord('c') and not controller.is_calibrated and not controller.is_calibrating:
                     controller.start_calibration()
                     calibration_message = "Stand still for calibration"
 
+                # Reset calibration
                 if key == ord('r'):
                     controller.reset_calibration()
+                    game_controller.reset()
                     calibration_message = "Press C to calibrate"
 
+                # Exit
                 if key == ord('q'):
                     break
 
+    except KeyboardInterrupt:
+        print("\nProgram interrupted by user.")
+
     finally:
+        game_controller.close()
         detector.close()
+        cv2.destroyAllWindows()
+        print("SubwayRun controller stopped safely.")
 
 
 if __name__ == "__main__":
