@@ -24,10 +24,9 @@ class GestureController:
         self.calibration_max_std = 0.015
         self.calibration_restarts = 0  # how many times it restarted (for UI/debug)
         self.min_torso_height = 0.05   # sanity check for calibration
-
         # All thresholds are RATIOS of the baseline torso_height
         # (so they don't depend on the distance from the camera).
-        # Tune them by printing `movement` while performing each gesture.
+        
         self.jump_threshold = -0.25    # shoulder goes UP (y decreases)
         self.slide_threshold = 0.25    # shoulder goes DOWN (y increases)
         self.left_threshold = -0.25
@@ -42,7 +41,7 @@ class GestureController:
     def is_landmark_visible(self, landmark):
         return landmark["visibility"] >= self.min_visibility
 
-    def _center(self, landmarks, left_idx, right_idx):
+    def _center(self, landmarks, left_idx, right_idx): #To calculate the center in general
         if landmarks is None:
             return None
 
@@ -61,10 +60,10 @@ class GestureController:
         return self._center(landmarks, LEFT_HIP, RIGHT_HIP)
 
     def extract_features(self, landmarks, require_hip=True):
-        """
-        require_hip=True  -> used in calibration (we need the full torso).
-        require_hip=False -> used at runtime (shoulders are enough).
-        """
+
+        #require_hip = True  -> used in calibration (we need the full torso).
+        #require_hip = False -> used at runtime (shoulders are enough).
+
         if landmarks is None:
             return None
 
@@ -100,11 +99,11 @@ class GestureController:
         return (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
 
     def _is_stable(self, samples):
-        """True if the shoulders stayed (almost) still during calibration."""
+        #True if the shoulders stayed (almost) still during calibration.
         xs = [s["shoulder_center"][0] for s in samples]
         ys = [s["shoulder_center"][1] for s in samples]
         return (
-            self._std(xs) < self.calibration_max_std
+            self._std(xs) < self.calibration_max_std #calculates Standard Deviation & make sure it is less than 0.015
             and self._std(ys) < self.calibration_max_std
         )
 
@@ -180,11 +179,13 @@ class GestureController:
 
         features = self.extract_features(landmarks, require_hip=False)
 
+        #visibility of the hip is not required to identify the movement.
+
         if features is None:
             return None
 
         th = self.baseline["torso_height"]  # normalization factor
-
+        #the movement is unaffected by the person’s distance from the camera.
         movement = {
             "shoulder_y": (features["shoulder_center"][1] - self.baseline["shoulder_center"][1]) / th,
             "shoulder_x": (features["shoulder_center"][0] - self.baseline["shoulder_center"][0]) / th,
@@ -200,13 +201,12 @@ class GestureController:
         return movement
 
     # ------------------------------------------------------------------
-    # Detectors (pure functions: no side effects)
+    # Detectors
     # ------------------------------------------------------------------
     def detect_jump(self, movement):
         if movement is None:
             return False
 
-        # y decreases when going up
         return movement["shoulder_y"] < self.jump_threshold
 
     def detect_slide(self, movement):
@@ -237,8 +237,8 @@ class GestureController:
             return "NONE"
 
         if self.detect_jump(movement):
-            now = time.monotonic()
-            if now - self.last_jump_time >= self.jump_cooldown:
+            now = time.monotonic() #Prevents repeated jump actions within the cooldown interval.
+            if now - self.last_jump_time >= self.jump_cooldown: 
                 self.last_jump_time = now
                 return "JUMP"
             return "NONE"  # still in cooldown, don't fall through to other actions
@@ -246,7 +246,8 @@ class GestureController:
         if self.detect_slide(movement):
             return "SLIDE"
 
-        # NOTE: if the frame is mirrored (selfie view), swap LEFT and RIGHT
+        # If the camera image is mirrored, verify whether LEFT and RIGHT
+        # actions need to be swapped to match the player's real-world movement.
         if self.detect_left(movement):
             return "LEFT"
 
