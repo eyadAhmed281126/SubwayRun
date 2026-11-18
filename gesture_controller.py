@@ -1,110 +1,134 @@
-#CONSTANTS
-# NOSE =0
+import time
+
+# CONSTANTS
+# NOSE = 0
 LEFT_SHOULDER = 11
-RIGHT_SHOULDER =12
-LEFT_HIP =23
-RIGHT_HIP =24
+RIGHT_SHOULDER = 12
+LEFT_HIP = 23
+RIGHT_HIP = 24
+
 
 class GestureController:
 
     def __init__(self):
-        self.min_visibility = 0.7 #the least visibility we accept 
-        self.baseline = None 
-        self.calibration_frames = 60 #60 correct features ready to be used
-        self.calibration_samples = [] #60 features 
-        self.is_calibrated = False #if we finished
-        self.is_calibrating = False #if we are calibrating currently
-        self.jump_threshold = -0.14
-        self.jump_shoulder_threshold = -0.09
-        self.slide_threshold = 0.08
-        self.left_threshold = -0.08
-        self.right_threshold = 0.08
+        self.min_visibility = 0.7      # the least visibility we accept
+        self.baseline = None
+        self.calibration_frames = 60   # 60 correct features ready to be used
+        self.calibration_samples = []  # collected features
+        self.is_calibrated = False     # if we finished
+        self.is_calibrating = False    # if we are calibrating currently
 
-    def is_landmark_visible(self, landmark): #method to make sure that the landmarks are visible before calculating
+        # Calibration stability: if the person moves during calibration
+        # (std of shoulder position above this), the samples are thrown away
+        # and calibration restarts automatically.
+        self.calibration_max_std = 0.015
+        self.calibration_restarts = 0  # how many times it restarted (for UI/debug)
+        self.min_torso_height = 0.05   # sanity check for calibration
+
+        # All thresholds are RATIOS of the baseline torso_height
+        # (so they don't depend on the distance from the camera).
+        # Tune them by printing `movement` while performing each gesture.
+        self.jump_threshold = -0.25    # shoulder goes UP (y decreases)
+        self.slide_threshold = 0.25    # shoulder goes DOWN (y increases)
+        self.left_threshold = -0.25
+        self.right_threshold = 0.25
+
+        self.jump_cooldown = 0.6       # seconds between two jumps
+        self.last_jump_time = 0.0
+
+    # ------------------------------------------------------------------
+    # Landmarks helpers
+    # ------------------------------------------------------------------
+    def is_landmark_visible(self, landmark):
         return landmark["visibility"] >= self.min_visibility
 
-    def get_shoulder_center(self, landmarks): #method to calculate shoulder's center
-        if landmarks is None: #there is no body on the screen
-            return None
-
-        left = landmarks[LEFT_SHOULDER]
-        right = landmarks[RIGHT_SHOULDER]
-
-        if not self.is_landmark_visible(left) or not self.is_landmark_visible(right): #calling the method
-            return None
-
-        center_x = (left["x"] + right["x"]) / 2
-        center_y = (left["y"] + right["y"]) / 2
-
-        return (center_x, center_y)
-
-    def get_hip_center(self, landmarks):
+    def _center(self, landmarks, left_idx, right_idx):
         if landmarks is None:
             return None
 
-        left = landmarks[LEFT_HIP]
-        right = landmarks[RIGHT_HIP]
+        left = landmarks[left_idx]
+        right = landmarks[right_idx]
 
         if not self.is_landmark_visible(left) or not self.is_landmark_visible(right):
             return None
 
-        center_x = (left["x"] + right["x"]) / 2
-        center_y = (left["y"] + right["y"]) / 2
+        return ((left["x"] + right["x"]) / 2, (left["y"] + right["y"]) / 2)
 
-        return (center_x, center_y)
+    def get_shoulder_center(self, landmarks):
+        return self._center(landmarks, LEFT_SHOULDER, RIGHT_SHOULDER)
 
-    def extract_features(self, landmarks):
+    def get_hip_center(self, landmarks):
+        return self._center(landmarks, LEFT_HIP, RIGHT_HIP)
+
+    def extract_features(self, landmarks, require_hip=True):
+        """
+        require_hip=True  -> used in calibration (we need the full torso).
+        require_hip=False -> used at runtime (shoulders are enough).
+        """
         if landmarks is None:
             return None
 
-        # nose = landmarks[NOSE]
-
-        # if not self.is_landmark_visible(nose):
-        #     return None
-
         shoulder_center = self.get_shoulder_center(landmarks)
-        hip_center = self.get_hip_center(landmarks)
-
-        if shoulder_center is None or hip_center is None:
+        if shoulder_center is None:
             return None
 
-        return {
-        # "nose": (nose["x"], nose["y"]),
-        "shoulder_center": shoulder_center,
-        "hip_center": hip_center,
-        "torso_height": hip_center[1] - shoulder_center[1]
-        }
+        hip_center = self.get_hip_center(landmarks)
+        if require_hip and hip_center is None:
+            return None
 
-    def start_calibration(self): #reset the baseline to start freshly with new person  delete and start
+        features = {"shoulder_center": shoulder_center}
+
+        if hip_center is not None:
+            features["hip_center"] = hip_center
+            features["torso_height"] = hip_center[1] - shoulder_center[1]
+
+        return features
+
+    # ------------------------------------------------------------------
+    # Calibration
+    # ------------------------------------------------------------------
+    def start_calibration(self):  # reset everything to start fresh with a new person
         self.baseline = None
         self.calibration_samples = []
+        self.calibration_restarts = 0
         self.is_calibrated = False
-        self.is_calibrating = True #we are ready to accept new samples
+        self.is_calibrating = True  # we are ready to accept new samples
 
-    def _calculate_baseline(self): #the average of the 60 features,  started with_ means it is an inner method (Convention)
+    @staticmethod
+    def _std(values):
+        mean = sum(values) / len(values)
+        return (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+
+    def _is_stable(self, samples):
+        """True if the shoulders stayed (almost) still during calibration."""
+        xs = [s["shoulder_center"][0] for s in samples]
+        ys = [s["shoulder_center"][1] for s in samples]
+        return (
+            self._std(xs) < self.calibration_max_std
+            and self._std(ys) < self.calibration_max_std
+        )
+
+    def _calculate_baseline(self):  # average of the collected features
         samples = self.calibration_samples
         count = len(samples)
 
-        baseline = {} 
+        baseline = {}
 
-        #EXAMPLE
+        # EXAMPLE
         # {
-        # "nose": (0.41, 0.21),
-        # "shoulder_center": (0.41, 0.4033),
-        # "hip_center": (0.46, 0.7033),
-        # "torso_height": 0.30 it is not tuple
+        #   "shoulder_center": (0.41, 0.4033),
+        #   "hip_center": (0.46, 0.7033),
+        #   "torso_height": 0.30   <- not a tuple
         # }
 
         for key in samples[0]:
-            if isinstance(samples[0][key], tuple): #questioning is it tuple? 
+            if isinstance(samples[0][key], tuple):
                 baseline[key] = (
-                sum(sample[key][0] for sample in samples) / count, #calculating average of x ->0
-                sum(sample[key][1] for sample in samples) / count #calculating average of y ->1
+                    sum(s[key][0] for s in samples) / count,  # average x
+                    sum(s[key][1] for s in samples) / count,  # average y
                 )
-            else: #if it is not tuple such as torso_height a single value
-                baseline[key] = sum(
-                sample[key] for sample in samples
-                ) / count
+            else:
+                baseline[key] = sum(s[key] for s in samples) / count
 
         return baseline
 
@@ -112,14 +136,24 @@ class GestureController:
         if not self.is_calibrating:
             return False
 
-        features = self.extract_features(landmarks)
+        features = self.extract_features(landmarks, require_hip=True)
 
         if features is None:
             return False
 
+        # ignore bad frames (e.g. person bending or tracking glitch)
+        if features["torso_height"] < self.min_torso_height:
+            return False
+
         self.calibration_samples.append(features)
 
-        if len(self.calibration_samples) >= self.calibration_frames: 
+        if len(self.calibration_samples) >= self.calibration_frames:
+            if not self._is_stable(self.calibration_samples):
+                # person moved while calibrating -> throw away and try again
+                self.calibration_samples = []
+                self.calibration_restarts += 1
+                return False
+
             self.baseline = self._calculate_baseline()
             self.is_calibrating = False
             self.is_calibrated = True
@@ -127,41 +161,53 @@ class GestureController:
 
         return False
 
-    def reset_calibration(self): #delete and stop
+    def reset_calibration(self):  # delete and stop
         self.baseline = None
         self.calibration_samples = []
+        self.calibration_restarts = 0
         self.is_calibrated = False
         self.is_calibrating = False
 
-    def get_calibration_progress(self): #returns the number of samples we collected and how many left to complete calibration
+    def get_calibration_progress(self):
         return len(self.calibration_samples), self.calibration_frames
 
+    # ------------------------------------------------------------------
+    # Movement
+    # ------------------------------------------------------------------
     def get_movement(self, landmarks):
-        if not self.is_calibrated: #make sure there is a baseline without it we can not compare
+        if not self.is_calibrated:  # no baseline -> nothing to compare with
             return None
 
-        features = self.extract_features(landmarks)
+        features = self.extract_features(landmarks, require_hip=False)
 
         if features is None:
             return None
 
-        return {
-        "hip_y": features["hip_center"][1] - self.baseline["hip_center"][1], 
-        "shoulder_y": features["shoulder_center"][1] - self.baseline["shoulder_center"][1],
-        "shoulder_x": features["shoulder_center"][0] - self.baseline["shoulder_center"][0],
-        "hip_x": features["hip_center"][0] - self.baseline["hip_center"][0]
+        th = self.baseline["torso_height"]  # normalization factor
+
+        movement = {
+            "shoulder_y": (features["shoulder_center"][1] - self.baseline["shoulder_center"][1]) / th,
+            "shoulder_x": (features["shoulder_center"][0] - self.baseline["shoulder_center"][0]) / th,
+            "hip_y": None,
+            "hip_x": None,
         }
 
+        # hip is optional (might be out of frame)
+        if "hip_center" in features:
+            movement["hip_y"] = (features["hip_center"][1] - self.baseline["hip_center"][1]) / th
+            movement["hip_x"] = (features["hip_center"][0] - self.baseline["hip_center"][0]) / th
+
+        return movement
+
+    # ------------------------------------------------------------------
+    # Detectors (pure functions: no side effects)
+    # ------------------------------------------------------------------
     def detect_jump(self, movement):
         if movement is None:
             return False
 
-        return (
-            movement["hip_y"] < self.jump_threshold #if the value of hip_y is decreasing, means it is a jump for the shoulder and hip
-            and
-            movement["shoulder_y"] < self.jump_shoulder_threshold
-        )
-
+        # y decreases when going up
+        return movement["shoulder_y"] < self.jump_threshold
 
     def detect_slide(self, movement):
         if movement is None:
@@ -175,14 +221,15 @@ class GestureController:
 
         return movement["shoulder_x"] < self.left_threshold
 
-
     def detect_right(self, movement):
         if movement is None:
             return False
 
         return movement["shoulder_x"] > self.right_threshold
 
-
+    # ------------------------------------------------------------------
+    # Final action
+    # ------------------------------------------------------------------
     def get_action(self, landmarks):  # turn landmarks into actions
         movement = self.get_movement(landmarks)
 
@@ -190,11 +237,16 @@ class GestureController:
             return "NONE"
 
         if self.detect_jump(movement):
-            return "JUMP"
+            now = time.monotonic()
+            if now - self.last_jump_time >= self.jump_cooldown:
+                self.last_jump_time = now
+                return "JUMP"
+            return "NONE"  # still in cooldown, don't fall through to other actions
 
         if self.detect_slide(movement):
             return "SLIDE"
 
+        # NOTE: if the frame is mirrored (selfie view), swap LEFT and RIGHT
         if self.detect_left(movement):
             return "LEFT"
 
